@@ -1,6 +1,6 @@
 {
   "name": "@aislop-inc/opencode-skill-learn",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "exports": {
     ".": "./index.ts",
