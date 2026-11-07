@@ -1,3 +1,6 @@
+> AISlop-Inc npm package: `@aislop-inc/opencode-skill-learn`.
+> Manual release instructions: [npm publishing](docs/NPM-PUBLISHING.md).
+
 # opencode-skill-learn
 
 OpenCode v2.2.5（OpenCode 2 / Desktop）向けの Learn Plugin。
@@ -118,3 +121,13 @@ GUI に実際の差分と統合済み全文を示し、**表示した `revision`
 /Users/mattyatea/.local/share/mise/installs/bun/1.4.4/bin/bun run test
 /Users/mattyatea/.local/share/mise/installs/bun/1.4.4/bin/bun run build
 ```
+
+## npm installation
+
+After the first npm publication, add this entry to the existing OpenCode plugins array:
+
+```json
+{"plugins": ["@aislop-inc/opencode-skill-learn@latest"]}
+```
+
+Do not add it alongside a local copy of the same plugin.
