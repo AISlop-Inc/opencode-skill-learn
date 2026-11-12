@@ -21,11 +21,10 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true })
 })
 
-const makeStore = (maxPending = 12) =>
+const makeStore = () =>
   new ProposalStore({
     dataDir: join(root, "data"),
     skillsDir: join(root, "skills"),
-    maxPending,
   })
 
 const EXISTING =
@@ -90,11 +89,11 @@ test("同じ Skill への提案は 1 件にまとめる", async () => {
   expect((await store.list()).proposals).toHaveLength(1)
 })
 
-test("pending の件数上限を超える新規提案は捨てる", async () => {
-  const store = makeStore(2)
+test("別セッションと共用の件数上限を設けない", async () => {
+  const store = makeStore()
   const result = await store.add([createAction("a"), createAction("b"), createAction("c")], source)
-  expect(result.added).toBe(2)
-  expect(result.skipped).toBe(1)
+  expect(result.added).toBe(3)
+  expect(result.skipped).toBe(0)
 })
 
 test("baseHash のない patch は保存しない", async () => {
@@ -347,7 +346,7 @@ test("複数 store インスタンスの同時 add で提案が消えない", as
   const b = makeStore()
   await Promise.all([a.add([createAction("skill-a")], source), b.add([createAction("skill-b")], source)])
   const ids = (await a.list()).proposals.map((item) => item.id).sort()
-  expect(ids).toEqual(["create:skill-a", "create:skill-b"])
+  expect(ids).toEqual(["ses_1:create:skill-a", "ses_1:create:skill-b"])
 })
 
 test("reject は表示した版と一致するときだけ成功する", async () => {
@@ -369,4 +368,62 @@ test("detail は書き込み先・revision・targetChanged を返す", async () 
   expect(detail.targetPath).toBe(join(root, "skills", "new-skill", "SKILL.md"))
   expect(detail.revision).toBeDefined()
   expect(detail.targetChanged).toBe(false)
+  expect(detail.writable).toBe(true)
+})
+
+test("却下した新規Skillは再起動後も再提案しない", async () => {
+  const store = makeStore()
+  await store.add([createAction("declined")], source)
+  const id = "ses_1:create:declined"
+  await store.reject(id, await revisionOf(store, id))
+  const again = makeStore()
+  const result = await again.add([createAction("declined", { title: "名前だけ変えた提案" })], source)
+  expect(result.skipped).toBe(1)
+  expect((await again.list()).proposals[0].status).toBe("rejected")
+})
+
+test("既存Skillの別の教訓は許可し、過去に却下した教訓の再掲は防ぐ", async () => {
+  const store = makeStore()
+  await store.add([patchAction()], source)
+  const id = "ses_1:patch:codex-ponytail"
+  await store.reject(id, await revisionOf(store, id))
+  const result = await store.add([patchAction({ section: "例外時に記録を確認する。", title: "別の教訓" })], source)
+  expect(result.added).toBe(1)
+  const again = makeStore()
+  const duplicate = await again.add([patchAction({ section: "変更前に 現在の挙動を確認する！" })], source)
+  expect(duplicate.skipped).toBe(1)
+  expect((await again.list()).proposals[0].title).toBe("別の教訓")
+  expect((await again.list()).rejected).toHaveLength(1)
+})
+
+test("旧形式に残る却下記録も再提案防止に使う", async () => {
+  const store = makeStore()
+  await store.add([createAction("legacy")], source)
+  await store.reject("ses_1:create:legacy", await revisionOf(store, "ses_1:create:legacy"))
+  const path = join(root, "data", "pending.json")
+  const old = JSON.parse(await readFile(path, "utf8"))
+  delete old.rejected
+  await writeFile(path, JSON.stringify(old))
+  expect((await makeStore().add([createAction("legacy")], source)).skipped).toBe(1)
+})
+
+test("別セッションの同名提案は上書きせず、セッションごとに返す", async () => {
+  const store = makeStore()
+  await store.add([createAction("same", { title: "セッションA" })], source)
+  await store.add([createAction("same", { title: "セッションB" })], { sessionID: "ses_2", title: "別作業" })
+  const first = await store.list("ses_1")
+  const second = await store.list("ses_2")
+  expect(first.sessionID).toBe("ses_1")
+  expect(first.proposals).toHaveLength(1)
+  expect(first.proposals[0].title).toBe("セッションA")
+  expect(second.proposals[0].title).toBe("セッションB")
+  expect((await store.list("missing")).proposals).toEqual([])
+})
+
+test("同じセッションでは別名でも本文が同じ教訓を重複保存しない", async () => {
+  const store = makeStore()
+  const body = "設定値が一致していても、どの処理経路を通って検証されているかを確認する。既定値から導出される設定は導出元も確認してからテストを追加する。"
+  const result = await store.add([createAction("test-path-a", { body }), createAction("test-path-b", { body })], source)
+  expect(result.added).toBe(1)
+  expect(result.skipped).toBe(1)
 })

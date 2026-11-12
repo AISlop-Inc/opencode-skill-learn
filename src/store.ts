@@ -1,7 +1,7 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, rename, rm, rmdir, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import type { ApproveResult, Detail, Proposal, RejectResult, Snapshot } from "./contract.ts"
-import { ensureWritableParent, isEnoent, readExisting } from "./fs.ts"
+import type { ApproveResult, Detail, Proposal, RejectResult, SkillFile, Snapshot } from "./contract.ts"
+import { codeOf, ensureWritableParent, isEnoent, readExisting } from "./fs.ts"
 import { hashText } from "./hash.ts"
 import { withFileLock } from "./lock.ts"
 import { lintProposal } from "./lint.ts"
@@ -13,12 +13,11 @@ import {
   redactSecrets,
   restoreMasked,
 } from "./redact.ts"
-import { sanitizeName } from "./review.ts"
+import { MAX_SUPPORT_FILES, sameLesson, sanitizeName, supportFilePath, wasRejected } from "./review.ts"
 
 export interface StoreOptions {
   dataDir: string
   skillsDir: string
-  maxPending?: number
 }
 
 export interface AddResult {
@@ -32,6 +31,7 @@ export interface AddResult {
 interface StoreFile {
   version: 1
   proposals: Proposal[]
+  rejected: Proposal[]
 }
 
 type ReadState =
@@ -40,7 +40,6 @@ type ReadState =
   | { kind: "corrupt"; reason: string }
 
 const FILE_NAME = "pending.json"
-const DEFAULT_MAX_PENDING = 12
 
 /**
  * 提案データの唯一の書き込み口。
@@ -52,25 +51,24 @@ const DEFAULT_MAX_PENDING = 12
 export class ProposalStore {
   private readonly dataDir: string
   private readonly skillsDir: string
-  private readonly maxPending: number
   private readonly file: string
   private queue: Promise<unknown> = Promise.resolve()
 
   constructor(options: StoreOptions) {
     this.dataDir = options.dataDir
     this.skillsDir = options.skillsDir
-    this.maxPending = Math.max(1, options.maxPending ?? DEFAULT_MAX_PENDING)
     this.file = join(this.dataDir, FILE_NAME)
   }
 
-  async list(): Promise<Snapshot> {
+  async list(sessionID?: string): Promise<Snapshot> {
     const state = await this.read()
-    const base = { proposals: [] as Proposal[], maxPending: this.maxPending, generatedAt: Date.now() }
+    const base = { proposals: [] as Proposal[], generatedAt: Date.now(), ...(sessionID ? { sessionID } : {}) }
     if (state.kind === "corrupt") return { ...base, corrupt: true, error: state.reason }
     if (state.kind === "missing") return base
     return {
       ...base,
-      proposals: state.file.proposals.slice().sort((a, b) => b.updatedAt - a.updatedAt),
+      proposals: state.file.proposals.filter((item) => !sessionID || item.sourceSessionID === sessionID).sort((a, b) => b.updatedAt - a.updatedAt),
+      rejected: state.file.rejected,
     }
   }
 
@@ -102,7 +100,10 @@ export class ProposalStore {
         current = safe.slice(0, 30_000)
       }
       writable = !existing.symlink
+      if (existing.symlink) readError = "SKILL.md 本体がシンボリックリンクのため保存できません"
       targetChanged = Boolean(proposal.baseHash) && hashText(existing.text) !== proposal.baseHash
+    } else if (existing.kind === "missing") {
+      writable = proposal.kind === "create"
     } else if (existing.kind === "error") {
       readError = existing.message
     }
@@ -119,7 +120,7 @@ export class ProposalStore {
     }
   }
 
-  /** 同じ Skill への pending は 1 件にまとめ、件数上限を超える新規提案は捨てる。 */
+  /** 同じセッション・同じ Skill への pending は 1 件にまとめる。 */
   add(actions: readonly PreparedAction[], source: { sessionID: string; title: string }): Promise<AddResult> {
     return this.locked(async () => {
       const state = await this.read()
@@ -134,7 +135,6 @@ export class ProposalStore {
       }
 
       const file = state.kind === "ok" ? state.file : empty()
-      let pendingCount = file.proposals.filter((item) => item.status === "pending").length
       let added = 0
       let merged = 0
       let skipped = 0
@@ -142,6 +142,10 @@ export class ProposalStore {
       for (const action of actions) {
         const name = sanitizeName(action.name)
         if (!name || !action.body.trim() || !safeName(name)) {
+          skipped++
+          continue
+        }
+        if (wasRejected({ ...action, name }, file.rejected)) {
           skipped++
           continue
         }
@@ -163,10 +167,16 @@ export class ProposalStore {
               }
             : {}),
           ...(action.targetPath ? { targetPath: action.targetPath } : {}),
+          // 統合時に古い値が残らないよう、キーは常に置く（undefined は保存時に消える）。
+          files: action.files?.length
+            ? action.files.map((item) => ({ path: item.path, content: redactSecrets(item.content) }))
+            : undefined,
+          archives: action.archives?.length ? action.archives.map((item) => ({ ...item })) : undefined,
         }
 
         // 全文をそのまま検査する。切った差分は検査に流用しない。
-        const full = `${fields.title}\n${fields.reason}\n${fields.body}\n${fields.diff}`
+        const fileText = (fields.files ?? []).map((item) => `${item.path}\n${item.content}`).join("\n")
+        const full = `${fields.title}\n${fields.reason}\n${fields.body}\n${fields.diff}\n${fileText}`
         if (hasUnredactedSecrets(full)) {
           skipped++
           continue
@@ -188,8 +198,17 @@ export class ProposalStore {
           diff: fields.diff,
           redacted,
         })
-        const id = `${action.action}:${name}`
-        const existing = file.proposals.find((item) => item.id === id)
+        if (action.skippedFiles?.length) {
+          warnings.push(`既存の補助ファイルは上書きしないため除外しました: ${action.skippedFiles.join(", ")}`)
+        }
+        const id = `${source.sessionID}:${action.action}:${name}`
+        const existing = file.proposals.find((item) => item.kind === action.action && item.name === name && item.sourceSessionID === source.sessionID)
+
+        const duplicate = file.proposals.some((item) => item !== existing && item.status === "pending" && item.sourceSessionID === source.sessionID && sameLesson(item.section || item.body, action.section || action.body))
+        if (duplicate) {
+          skipped++
+          continue
+        }
 
         if (existing && existing.status === "pending") {
           Object.assign(existing, fields, {
@@ -199,11 +218,6 @@ export class ProposalStore {
             sourceTitle: source.title,
           })
           merged++
-          continue
-        }
-
-        if (pendingCount >= this.maxPending) {
-          skipped++
           continue
         }
 
@@ -225,7 +239,6 @@ export class ProposalStore {
         } else {
           file.proposals.push(next)
         }
-        pendingCount++
         added++
       }
 
@@ -235,7 +248,7 @@ export class ProposalStore {
         added,
         merged,
         skipped,
-        ...(total === 0 ? { reason: "提案なし、または pending の上限に達しました" } : {}),
+        ...(total === 0 ? { reason: "新しい提案がないか、却下済みの教訓と重複しています" } : {}),
       }
     })
   }
@@ -340,6 +353,10 @@ export class ProposalStore {
         }
       }
 
+      const skillDir = dirname(targetPath)
+      const supportError = await checkSupportFiles(skillDir, proposal.files ?? [])
+      if (supportError) return { ok: false, failedAt: "target", reason: supportError }
+
       let backupPath: string | undefined
       if (existing.kind === "ok") {
         backupPath = join(
@@ -378,20 +395,35 @@ export class ProposalStore {
         return { ok: false, failedAt: "store", reason: `提案データの更新に失敗しました: ${errorMessage(cause)}` }
       }
 
+      // 補助ファイルを先に作り、SKILL.md を最後に書く。途中で失敗したら作ったものを消して pending に戻す。
+      const created: string[] = []
+      const createdDirs: string[] = []
       try {
+        for (const item of proposal.files ?? []) {
+          const path = join(skillDir, item.path)
+          const made = await mkdir(dirname(path), { recursive: true })
+          if (made) createdDirs.push(made)
+          // wx: 承認前の確認のあとに作られたファイルも上書きしない。
+          await writeFile(path, item.content, { encoding: "utf8", mode: 0o644, flag: "wx" })
+          created.push(path)
+        }
         await this.writeSkill(targetPath, body)
       } catch (cause) {
+        for (const path of created.reverse()) await rm(path, { force: true }).catch(() => undefined)
+        for (const dir of createdDirs.reverse()) await rmdir(dir).catch(() => undefined)
         proposal.status = "pending"
         proposal.updatedAt = Date.now()
         delete proposal.resolvedAt
         await this.write(file).catch(() => undefined)
-        return { ok: false, failedAt: "write", reason: `SKILL.md の書き込みに失敗しました: ${errorMessage(cause)}` }
+        const what = created.length < (proposal.files?.length ?? 0) ? "補助ファイル" : "SKILL.md"
+        return { ok: false, failedAt: "write", reason: `${what}の書き込みに失敗しました: ${errorMessage(cause)}` }
       }
 
       return {
         ok: true,
         targetPath,
         ...(backupPath ? { backupPath } : {}),
+        ...(proposal.files?.length ? { files: proposal.files.map((item) => item.path) } : {}),
       }
     })
   }
@@ -415,6 +447,7 @@ export class ProposalStore {
       proposal.status = "rejected"
       proposal.updatedAt = now
       proposal.resolvedAt = now
+      file.rejected.push({ ...proposal })
       await this.write(file)
       return { ok: true }
     })
@@ -453,7 +486,12 @@ export class ProposalStore {
       if (parsed?.version !== 1 || !Array.isArray(parsed.proposals)) {
         return { kind: "corrupt", reason: "pending.json の形式が不正です" }
       }
-      return { kind: "ok", file: { version: 1, proposals: parsed.proposals.filter(isProposal) } }
+      if (parsed.rejected !== undefined && (!Array.isArray(parsed.rejected) || !parsed.rejected.every(isProposal))) {
+        return { kind: "corrupt", reason: "却下履歴の形式が不正です" }
+      }
+      const proposals = parsed.proposals.filter(isProposal)
+      const rejected = parsed.rejected ?? proposals.filter((item) => item.status === "rejected")
+      return { kind: "ok", file: { version: 1, proposals, rejected } }
     } catch {
       return { kind: "corrupt", reason: "pending.json を JSON として解釈できません" }
     }
@@ -490,14 +528,48 @@ function revisionOf(proposal: Proposal): string {
       warnings: proposal.warnings,
       section: proposal.section ?? "",
       baseHash: proposal.baseHash ?? "",
+      files: proposal.files ?? [],
+      archives: proposal.archives ?? [],
       status: proposal.status,
       updatedAt: proposal.updatedAt,
     }),
   )
 }
 
+/**
+ * 承認前に補助ファイルを検査する。パスの形式、件数、秘密情報、
+ * references/・templates/ がシンボリックリンクでないこと、ファイルがまだないことを確かめる。
+ */
+async function checkSupportFiles(skillDir: string, files: readonly SkillFile[]): Promise<string | undefined> {
+  if (files.length > MAX_SUPPORT_FILES) return `補助ファイルは最大 ${MAX_SUPPORT_FILES} 件です`
+  const seen = new Set<string>()
+  for (const item of files) {
+    if (supportFilePath(item.path) !== item.path || seen.has(item.path)) {
+      return `補助ファイルのパスが不正です: ${item.path}`
+    }
+    seen.add(item.path)
+    if (hasUnredactedSecrets(item.content)) {
+      return `補助ファイルに秘密情報の可能性があるため書き込みません: ${item.path}`
+    }
+    const dir = join(skillDir, dirname(item.path))
+    try {
+      const info = await lstat(dir)
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        return `${dirname(item.path)}/ が通常のフォルダではないため書き込みません`
+      }
+    } catch (cause) {
+      if (!isEnoent(cause)) return `${dirname(item.path)}/ を確認できません (${codeOf(cause) ?? "unknown"})`
+    }
+    const existing = await readExisting(join(skillDir, item.path))
+    if (existing.kind !== "missing") {
+      return `補助ファイル ${item.path} がすでにあります。上書きを避けるため書き込みません。却下して振り返り直してください`
+    }
+  }
+  return undefined
+}
+
 function empty(): StoreFile {
-  return { version: 1, proposals: [] }
+  return { version: 1, proposals: [], rejected: [] }
 }
 
 function safeName(name: string): boolean {

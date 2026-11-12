@@ -1,4 +1,5 @@
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import type { ArchiveTarget, SkillFile } from "./contract.ts"
 import { buildComposePrompt, validateComposedText } from "./compose.ts"
 import { textDiff } from "./diff.ts"
 import { readExisting } from "./fs.ts"
@@ -23,6 +24,10 @@ export interface PreparedAction extends ReviewAction {
   secretCount?: number
   /** 列挙で判明した実際の SKILL.md パス。 */
   targetPath?: string
+  /** 整理の提案のとき、承認後にアーカイブする Skill と提案時点のハッシュ。 */
+  archives?: ArchiveTarget[]
+  /** すでに存在するため除外した補助ファイル。上書きはしない。 */
+  skippedFiles?: string[]
 }
 
 export interface PrepareOptions {
@@ -78,6 +83,12 @@ export async function prepareActions(
       continue
     }
 
+    const support = await newSupportFiles(action.files, dirname(path))
+    const extra = {
+      ...(support.files.length > 0 ? { files: support.files } : { files: undefined }),
+      ...(support.skipped.length > 0 ? { skippedFiles: support.skipped } : {}),
+    }
+
     if (file.kind === "missing") {
       if (!FRONTMATTER.test(lesson)) {
         dropped.push({ name, reason: "更新先がなく、frontmatter もありません" })
@@ -85,6 +96,7 @@ export async function prepareActions(
       }
       prepared.push({
         ...action,
+        ...extra,
         action: "create",
         body: lesson,
         diff: redactSecrets(action.diff),
@@ -124,6 +136,7 @@ export async function prepareActions(
     const diff = textDiff(redactSecrets(masked.masked), composed.text)
     prepared.push({
       ...action,
+      ...extra,
       action: "patch",
       body: composed.text,
       diff,
@@ -135,4 +148,16 @@ export async function prepareActions(
   }
 
   return { actions: prepared, dropped }
+}
+
+/** 補助ファイルのうち、まだ存在しないものだけを残す。既存の補助ファイルは上書きしない。 */
+async function newSupportFiles(files: readonly SkillFile[] | undefined, skillDir: string): Promise<{ files: SkillFile[]; skipped: string[] }> {
+  const kept: SkillFile[] = []
+  const skipped: string[] = []
+  for (const file of files ?? []) {
+    const existing = await readExisting(join(skillDir, file.path))
+    if (existing.kind === "missing") kept.push({ path: file.path, content: redactSecrets(file.content) })
+    else skipped.push(file.path)
+  }
+  return { files: kept, skipped }
 }
