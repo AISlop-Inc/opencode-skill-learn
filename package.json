@@ -11,7 +11,7 @@
   },
   "scripts": {
     "typecheck": "mise exec node@24.21.0 bun@1.4.4 -- tsc --noEmit",
-    "test": "mise exec node@24.21.0 bun@1.4.4 -- bun test",
+    "test": "mise exec node@24.21.0 bun@1.4.4 -- bun test ./test",
     "build": "mise exec node@24.21.0 bun@1.4.4 -- vite build"
   },
   "devDependencies": {
